@@ -116,7 +116,7 @@ def get_d_paretomtl_infoentropy(grads, losses_vec, ref_vec, pref_idx, recloss, t
     gx =  torch.matmul(w, losses_vec / torch.norm(losses_vec))
     idx = gx > 0
 
-    if recloss.detach().cpu().item() <= thre:   # without consideration of recommendation loss 只在recloss小于阈值时才考虑最小化信息熵
+    if recloss.detach().cpu().item() <= thre:   # without consideration of recommendation loss 只在recloss小于阈值时才考虑最大化信息熵
         if info_entrophy.detach().cpu().item() <=thre_ie:   # without consideration of information entrophy
             grads = grads[:-2]#去除后面的两项梯度（recloss和infoentrophy）
             if torch.sum(idx) <= 0:
@@ -146,7 +146,7 @@ def get_d_paretomtl_infoentropy(grads, losses_vec, ref_vec, pref_idx, recloss, t
     
     else:   # take recommendation loss into consideration(梯度长度为3）  
         #if info_entrophy.detach().cpu().item() <=thre_ie:   # without consideration of information entrophy
-        grads=grads[:-1]  #去掉最后一项（信息熵的梯度）
+        grads=grads[:-1]  #去掉最后一项（信息熵loss的梯度）
         if torch.sum(idx) <= 0:
             sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
             return torch.tensor(sol).cuda().float()
@@ -157,17 +157,6 @@ def get_d_paretomtl_infoentropy(grads, losses_vec, ref_vec, pref_idx, recloss, t
         weight = torch.stack([weight0, weight1, torch.tensor(sol[2]).to(w.device)])
         return weight
         
-       # else:     #take information entrophy into consideration
-       #    if torch.sum(idx) <= 0:
-       #        sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-       #        return torch.tensor(sol).cuda().float()
-       #    vec = torch.cat((grads, torch.matmul(w[idx], grads[:-1])))
-       #    sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-       #    weight0 = sol[0] + torch.sum(torch.stack([sol[j]*w[idx][j-4,0] for j in torch.arange(4, 4+torch.sum(idx))]))
-       #    weight1 = sol[1] + torch.sum(torch.stack([sol[j]*w[idx][j-4,1] for j in torch.arange(4, 4+torch.sum(idx))]))
-       #    weight = torch.stack([weight0, weight1, torch.tensor(sol[2]).to(w.device), torch.tensor(sol[3]).to(w.device)])
-       #    return weight#
-
 
 def get_d_paretomtl_recloss(grads, losses_vec, ref_vec, pref_idx, recloss, thre):
     """ calculate the gradient direction for ParetoMTL """
