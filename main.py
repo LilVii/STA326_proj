@@ -1,421 +1,264 @@
-import numpy as np
 import torch
-import torch.utils.data
+import time
+from utils.utils import parse_args, setup_seed, random_sampler
+from utils.models import BaseMF
+from utils.dataloader import get_dataloader, get_data
+from utils.evaluate import calculate_noranking_fairness, New_Eval, deg, display_all_results, display_noranking_results, f1
+from utils.optimtools import get_preference_vectors, batch_group_probs, get_d_paretomtl_init, get_d_paretomtl_recloss,get_d_paretomtl_infoentropy
 from torch.autograd import Variable
+import math,heapq
+import torch.nn as nn
+import numpy as np
+import pickle
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
-def circle_points(r, n):
-    """
-    generate evenly distributed unit preference vectors for two tasks
-    """
-    circles = []
-    for r, n in zip(r, n):
-        t = np.linspace(0, 0.5 * np.pi, n)
-        x = r * np.cos(t)
-        y = r * np.sin(t)
-        circles.append(np.c_[x, y])
-    return circles
+class EarlyStopping:    # different from EarlyStopping from utils.utils!
+    def __init__(self, patience=5):
+        self.patience = patience
+        self.counter = 0
+        self.best_score = 99
+        self.early_stop = False
+        self.best_state = None
+        self.inzone = True
 
-
-def get_preference_vectors(npref):
-    vectors = np.zeros((npref,2))
-    for i in range(npref):
-        t = (i+0.5) * np.pi/(2*npref)
-        vectors[i] = np.array([np.cos(t),np.sin(t)])
-    return vectors
-
-
-# 0417_0418 version
-def batch_fairness(args, users, item_groups, user_neighbors, pos_items, neg_items, pos_scores, neg_scores):
-    item_groups, user_neighbors = torch.LongTensor(item_groups).to(args.device), torch.LongTensor(user_neighbors).to(args.device)
-    pos_items_groups, neg_items_groups, user_utilities = item_groups[pos_items], item_groups[neg_items], user_neighbors[users]
-    # pos_items_groups, neg_items_groups, user_utilities = item_groups[pos_items], item_groups[neg_items], user_neighbors[users]+1
-    sp_pt, nsp_pt, eo_pt, neo_pt, speo_pt, nspeo_pt = [torch.zeros(args.num_group).to(args.device) for _ in range(6)]
-    pos_prob, neg_prob = torch.sigmoid(pos_scores), torch.sigmoid(neg_scores)
-    
-    for idx in range(args.num_group):
-        pos_indices, neg_indices = pos_items_groups==idx, neg_items_groups==idx
-        selected_pos_items, selected_neg_items = pos_items[pos_indices], neg_items[neg_indices]
-        selected_pos_scores, selected_neg_scores = pos_prob[pos_indices], neg_prob[neg_indices]
-        pos_user_utilities, neg_user_utilities = user_utilities[pos_indices], user_utilities[neg_indices]
-
-        speo = torch.mean(torch.cat((selected_pos_scores, selected_neg_scores)))
-        nspeo = torch.mean(torch.cat((selected_pos_scores*pos_user_utilities, selected_neg_scores*neg_user_utilities)))
-        sp, nsp = torch.mean(selected_neg_scores), torch.mean(selected_neg_scores*neg_user_utilities)
-        eo, neo = torch.mean(selected_pos_scores), torch.mean(selected_pos_scores*pos_user_utilities)
-        sp_pt[idx], nsp_pt[idx], eo_pt[idx], neo_pt[idx], speo_pt[idx], nspeo_pt[idx] = sp, nsp, eo, neo, speo, nspeo
-    
-    if args.mode == 'sp_eo':
-        return speo_pt, nspeo_pt
-    elif args.mode == 'sp':
-        return sp_pt, nsp_pt
-    elif args.mode == 'eo':
-        return eo_pt, neo_pt
-    raise NotImplementedError
-
-
-def batch_group_probs(args, users, item_groups, user_neighbors, pos_items, neg_items, pos_scores, neg_scores):
-    user_utilities = user_neighbors[users]
-    if args.mode == 'eo':
-        eo_pt, neo_pt = torch.zeros(args.num_group).to(args.device), torch.zeros(args.num_group).to(args.device)
-        pos_items_groups, pos_prob = item_groups[pos_items], torch.sigmoid(pos_scores)
-        for idx in range(args.num_group):
-            pos_indices = pos_items_groups==idx
-            selected_pos_items, selected_pos_scores, pos_user_utilities = pos_items[pos_indices], pos_prob[pos_indices], user_utilities[pos_indices]
-            eo_pt[idx], neo_pt[idx] = torch.mean(selected_pos_scores), torch.mean(selected_pos_scores*pos_user_utilities)
-        return eo_pt, neo_pt
-    elif args.mode == 'sp':
-        sp_pt, nsp_pt = torch.zeros(args.num_group).to(args.device), torch.zeros(args.num_group).to(args.device)
-        neg_items_groups, neg_prob = item_groups[neg_items], torch.sigmoid(neg_scores)
-        for idx in range(args.num_group):
-            neg_indices = neg_items_groups==idx
-            selected_neg_items, selected_neg_scores, neg_user_utilities = neg_items[neg_indices], neg_prob[neg_indices], user_utilities[neg_indices]
-            sp_pt[idx], nsp_pt[idx] = torch.mean(selected_neg_scores), torch.mean(selected_neg_scores*neg_user_utilities)
-        return sp_pt, nsp_pt
-
-
-def get_d_paretomtl_init(grads,value,weights,i):
-    """ 
-    calculate the gradient direction for ParetoMTL initialization 
-    """
-    
-    flag = False
-    nobj = value.shape
-   
-    # check active constraints
-    current_weight = weights[i]
-    rest_weights = weights
-    w = rest_weights - current_weight
-    
-    gx =  torch.matmul(w,value/torch.norm(value))
-    idx = gx >  0
-   
-    # calculate the descent direction
-    if torch.sum(idx) <= 0:
-        flag = True
-        return flag, torch.zeros(nobj)
-    if torch.sum(idx) == 1:
-        sol = torch.ones(1).cuda().float()
-    else:
-        vec =  torch.matmul(w[idx],grads)
-        sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-
-
-    weight0 =  torch.sum(torch.stack([sol[j] * w[idx][j ,0] for j in torch.arange(0, torch.sum(idx))]))
-    weight1 =  torch.sum(torch.stack([sol[j] * w[idx][j ,1] for j in torch.arange(0, torch.sum(idx))]))
-    weight = torch.stack([weight0,weight1])
-   
-    
-    return flag, weight
-
-#把信息熵作为限制条件，thre_ie为它的阈值（应该不小于不加入loss限制的信息熵以保证有feasible solution）
-def get_d_paretomtl_infoentropy(grads, losses_vec, ref_vec, pref_idx, recloss, thre, info_entrophy, thre_ie):
-    """ calculate the gradient direction for ParetoMTL """
-    current_weight = ref_vec[pref_idx]  # check active constraints
-    w = ref_vec - current_weight
-    gx =  torch.matmul(w, losses_vec / torch.norm(losses_vec))
-    idx = gx > 0
-
-    if recloss.detach().cpu().item() <= thre:   # without consideration of recommendation loss 只在recloss小于阈值时才考虑最大化信息熵
-        if info_entrophy.detach().cpu().item() <=thre_ie:   # without consideration of information entrophy
-            grads = grads[:-2]#去除后面的两项梯度（recloss和infoentrophy）
-            if torch.sum(idx) <= 0:
-                sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-                return torch.tensor(sol).cuda().float()
-            vec = torch.cat((grads, torch.matmul(w[idx], grads)))
-            sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-            weight0 = sol[0] + torch.sum(torch.stack([sol[j]*w[idx][j-2,0] for j in torch.arange(2, 2+torch.sum(idx))]))
-            weight1 = sol[1] + torch.sum(torch.stack([sol[j]*w[idx][j-2,1] for j in torch.arange(2, 2+torch.sum(idx))]))
-            weight = torch.stack([weight0, weight1])
-            return weight
+    def __call__(self, score, model, inzone):
+        if self.inzone is False and inzone is True:
+            self.save_checkpoint(score, model)
+            self.inzone = True
+        elif self.inzone == inzone and score <= self.best_score:
+            self.save_checkpoint(score, model)
+        else:   # (self.inzone is True and inzone is False) or (self.inzone == inzone and score < self.best_score)
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        return self.early_stop
         
-        else:    #take information entrophy into consideration(梯度长度为3）
-            grads=torch.cat((grads[:-2], grads[-1:]))#去除倒数第两项梯度（recloss）
-            if torch.sum(idx) <= 0:
-                sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-                return torch.tensor(sol).cuda().float()
-            vec = torch.cat((grads, torch.matmul(w[idx], grads[:-1])))
-            sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-            weight0 = sol[0] + torch.sum(torch.stack([sol[j]*w[idx][j-3,0] for j in torch.arange(3, 3+torch.sum(idx))]))
-            weight1 = sol[1] + torch.sum(torch.stack([sol[j]*w[idx][j-3,1] for j in torch.arange(3, 3+torch.sum(idx))]))
-            #最后一项是没有用的
-            weight = torch.stack([weight0, weight1,torch.tensor(sol[2]).to(w.device), weight1])
-            return weight
+    def save_checkpoint(self, score, model):
+        self.best_state = {key: value.cpu() for key, value in model.state_dict().items()}                
+        self.best_score = score
+        self.counter = 0
+
+
+def found_initial_solution(args, rsd, rsdn):
+    degree = deg([rsd, rsdn])
+    mindeg, maxdeg = 90 * args.pref_idx / args.npref, 90 * (args.pref_idx+1) / args.npref
+    if degree > mindeg and degree < maxdeg:
+        return True
+    return False
+
+#计算信息熵
+
+def calculate_Info_Entropy(item_groups, users, rec, topic_num, K=20):
+    num_topics = 6  
+    total_entropy = 0    
+    for u in users:
+        heap = rec[u].to('cpu')
+        # 获取前K个推荐项
+        topK = torch.topk(heap, K).indices
+        map_topic2num = torch.zeros(num_topics, dtype=torch.float32)      
+        # 计算每个组中有多少项
+        for k in topK:
+            map_topic2num[item_groups[k].item()] += 1       
+        # 包括正样本（所有交互过的项）
+        map_topic2num += torch.tensor(topic_num[u.item()], dtype=torch.float32).to('cpu') 
+        total_count = torch.sum(map_topic2num)
+        prob_distribution = map_topic2num / total_count          
+        # 计算信息熵
+        entropy = -torch.sum(prob_distribution * torch.log(prob_distribution + 1e-9)) / math.log(num_topics)
+        total_entropy += entropy.item()    
+    return total_entropy / len(users)
+
+
+def train_model(item_groups, user_neighbors):
+    ref_vec = torch.tensor(get_preference_vectors(npref)).to(device).float()    # circle_points([1], [npref])[0]
+    print('Preference Vector ({}/{}):'.format(pref_idx + 1, npref))
+    print(ref_vec[pref_idx].cpu().numpy(), 90*(0.5+pref_idx)/npref)
+    optimizer_initial = torch.optim.Adam(model.parameters(), lr=args.initsol_lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    earlystopper = EarlyStopping(patience=args.patience)    # default: 5
+    Rec = model.predict().detach().cpu().numpy()
+    prob_list, nprob_list = calculate_noranking_fairness(args, Rec, val_dict, train_list, item_groups, user_neighbors)
+    _, _ = display_noranking_results(args, prob_list, nprob_list)
     
-    
-    
-    else:   # take recommendation loss into consideration(梯度长度为3）  
-        #if info_entrophy.detach().cpu().item() <=thre_ie:   # without consideration of information entrophy
-        grads=grads[:-1]  #去掉最后一项（信息熵loss的梯度）
-        if torch.sum(idx) <= 0:
-            sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-            return torch.tensor(sol).cuda().float()
-        vec = torch.cat((grads, torch.matmul(w[idx], grads[:-1])))
-        sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-        weight0 = sol[0] + torch.sum(torch.stack([sol[j]*w[idx][j-3,0] for j in torch.arange(3, 3+torch.sum(idx))]))
-        weight1 = sol[1] + torch.sum(torch.stack([sol[j]*w[idx][j-3,1] for j in torch.arange(3, 3+torch.sum(idx))]))
-        weight = torch.stack([weight0, weight1, torch.tensor(sol[2]).to(w.device)])
-        return weight
+    print('----- Finding the initial solution -----')
+    for step in range(args.initsol_epoch):
+        torch.cuda.empty_cache()
+        print('********** Step {} **********'.format(step+1))
+        item_groups, user_neighbors = torch.LongTensor(item_groups).to(device), torch.LongTensor(user_neighbors).to(device)
+        model.train()
+        for _, (users, pos_items) in enumerate(train_loader):
+            grads, losses_vec = {0:[],1:[]}, []
+            neg_items = random_sampler(users.numpy(), pos_items.numpy(), train_list, args)
+            users, pos_items, neg_items = users.to(device), pos_items.to(device), neg_items.to(device)
+            pos_scores, neg_scores = model.calculate_pos_neg_scores(users, pos_items, neg_items)
+            speo_pt, nspneo_pt = batch_group_probs(args, users, item_groups, user_neighbors, pos_items, neg_items, pos_scores, neg_scores)
+            rsd_speo, rsd_nspneo = torch.std(speo_pt) / torch.mean(speo_pt), torch.std(nspneo_pt) / torch.mean(nspneo_pt)
+
+            optimizer_initial.zero_grad()   # SP/EO
+            rsd_speo.backward(retain_graph=True)
+            for param in model.parameters():
+                if param.grad is not None:
+                    grads[0].append(Variable(param.grad.data.clone().flatten(), requires_grad=False))
+            
+            optimizer_initial.zero_grad()   # NSP/NEO
+            rsd_nspneo.backward(retain_graph=True)
+            for param in model.parameters():
+                if param.grad is not None:
+                    grads[1].append(Variable(param.grad.data.clone().flatten(), requires_grad=False))
+            
+            grads = torch.stack([torch.cat(grads[i]) for i in range(2)])
+            losses_vec = torch.stack([rsd_speo.data, rsd_nspneo.data])    # calculate the weights
+            _, weight_vec = get_d_paretomtl_init(grads, losses_vec, ref_vec, pref_idx)
+            optimizer_initial.zero_grad()
+            loss_total = weight_vec[0] * rsd_speo + weight_vec[1] * rsd_nspneo
+            loss_total.backward()
+            optimizer_initial.step()
         
-
-def get_d_paretomtl_recloss(grads, losses_vec, ref_vec, pref_idx, recloss, thre):
-    """ calculate the gradient direction for ParetoMTL """
-    current_weight = ref_vec[pref_idx]  # check active constraints
-    w = ref_vec - current_weight
-    gx =  torch.matmul(w, losses_vec / torch.norm(losses_vec))
-    idx = gx > 0
-
-    if recloss.detach().cpu().item() <= thre:   # without consideration of recommendation loss
-        grads = grads[:-1]
-        if torch.sum(idx) <= 0:
-            sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-            return torch.tensor(sol).cuda().float()
-        vec = torch.cat((grads, torch.matmul(w[idx], grads)))
-        sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-        weight0 = sol[0] + torch.sum(torch.stack([sol[j]*w[idx][j-2,0] for j in torch.arange(2, 2+torch.sum(idx))]))
-        weight1 = sol[1] + torch.sum(torch.stack([sol[j]*w[idx][j-2,1] for j in torch.arange(2, 2+torch.sum(idx))]))
-        weight = torch.stack([weight0, weight1])
-        return weight
-    else:   # take recommendation loss into consideration
-        if torch.sum(idx) <= 0:
-            sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-            return torch.tensor(sol).cuda().float()
-        vec = torch.cat((grads, torch.matmul(w[idx], grads[:-1])))
-        sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-        weight0 = sol[0] + torch.sum(torch.stack([sol[j]*w[idx][j-3,0] for j in torch.arange(3, 3+torch.sum(idx))]))
-        weight1 = sol[1] + torch.sum(torch.stack([sol[j]*w[idx][j-3,1] for j in torch.arange(3, 3+torch.sum(idx))]))
-        weight = torch.stack([weight0, weight1, torch.tensor(sol[2]).to(w.device)])
-        return weight
-
-
-def get_d_paretomtl_wo_recloss(grads, losses_vec, ref_vec, pref_idx):
-    """ calculate the gradient direction for ParetoMTL """
-    current_weight = ref_vec[pref_idx]  # check active constraints
-    w = ref_vec - current_weight
-    gx =  torch.matmul(w, losses_vec / torch.norm(losses_vec))
-    idx = gx > 0
-    if torch.sum(idx) <= 0:
-        sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-        return torch.tensor(sol).cuda().float()
-    
-    vec = torch.cat((grads, torch.matmul(w[idx], grads)))
-    sol, nd = MinNormSolver.find_min_norm_element([[vec[t]] for t in range(len(vec))])
-    weight0 = sol[0] + torch.sum(torch.stack([sol[j]*w[idx][j-2,0] for j in torch.arange(2, 2+torch.sum(idx))]))
-    weight1 = sol[1] + torch.sum(torch.stack([sol[j]*w[idx][j-2,1] for j in torch.arange(2, 2+torch.sum(idx))]))
-    weight = torch.stack([weight0, weight1])
-    return weight
-
-
-def get_d_moomtl_wo_recloss(grads):
-    """ calculate the gradient direction for MOOMTL """
-    sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-    return torch.tensor(sol).cuda().float()
-
-
-def get_d_moomtl(grads, recloss, thre):
-    if recloss.detach().cpu().item() <= thre:   # without consideration of recommendation loss
-        grads = grads[:-1]
-    sol, nd = MinNormSolver.find_min_norm_element([[grads[t]] for t in range(len(grads))])
-    return torch.tensor(sol).cuda().float()
-
-
-def single_batch_group_probs(args, users, item_groups, user_neighbors, pos_items, neg_items, pos_scores, neg_scores):
-    user_utilities = user_neighbors[users]
-    if args.mode in {'eo','neo'}:
-        eo_pt, neo_pt = torch.zeros(args.num_group).to(args.device), torch.zeros(args.num_group).to(args.device)
-        pos_items_groups, pos_prob = item_groups[pos_items], torch.sigmoid(pos_scores)
-        for idx in range(args.num_group):
-            pos_indices = pos_items_groups==idx
-            selected_pos_items, selected_pos_scores, pos_user_utilities = pos_items[pos_indices], pos_prob[pos_indices], user_utilities[pos_indices]
-            eo_pt[idx], neo_pt[idx] = torch.mean(selected_pos_scores), torch.mean(selected_pos_scores*pos_user_utilities)
-        if args.mode == 'eo':
-            return eo_pt
-        return neo_pt
-    elif args.mode in {'sp','nsp'}:
-        sp_pt, nsp_pt = torch.zeros(args.num_group).to(args.device), torch.zeros(args.num_group).to(args.device)
-        neg_items_groups, neg_prob = item_groups[neg_items], torch.sigmoid(neg_scores)
-        for idx in range(args.num_group):
-            neg_indices = neg_items_groups==idx
-            selected_neg_items, selected_neg_scores, neg_user_utilities = neg_items[neg_indices], neg_prob[neg_indices], user_utilities[neg_indices]
-            sp_pt[idx], nsp_pt[idx] = torch.mean(selected_neg_scores), torch.mean(selected_neg_scores*neg_user_utilities)
-        if args.mode == 'sp':
-            return sp_pt
-        return nsp_pt
-
-
-class MinNormSolver:
-    MAX_ITER = 250
-    STOP_CRIT = 1e-5
-
-    def _min_norm_element_from2(v1v1, v1v2, v2v2):
-        """
-        Analytical solution for min_{c} |cx_1 + (1-c)x_2|_2^2
-        d is the distance (objective) optimzed
-        v1v1 = <x1,x1>
-        v1v2 = <x1,x2>
-        v2v2 = <x2,x2>
-        """
-        if v1v2 >= v1v1:
-            # Case: Fig 1, third column
-            gamma = 0.999
-            cost = v1v1
-            return gamma, cost
-        if v1v2 >= v2v2:
-            # Case: Fig 1, first column
-            gamma = 0.001
-            cost = v2v2
-            return gamma, cost
-        # Case: Fig 1, second column
-        gamma = -1.0 * ( (v1v2 - v2v2) / (v1v1+v2v2 - 2*v1v2) )
-        cost = v2v2 + gamma*(v1v2 - v2v2)
-        return gamma, cost
-
-    def _min_norm_2d(vecs, dps):
-        """
-        Find the minimum norm solution as combination of two points
-        This is correct only in 2D
-        ie. min_c |\sum c_i x_i|_2^2 st. \sum c_i = 1 , 1 >= c_1 >= 0 for all i, c_i + c_j = 1.0 for some i, j
-        """
-        dmin = 1e8
-        for i in range(len(vecs)):
-            for j in range(i+1,len(vecs)):
-                if (i,j) not in dps:
-                    dps[(i, j)] = 0.0
-                    for k in range(len(vecs[i])):
-                        dps[(i,j)] += torch.dot(vecs[i][k], vecs[j][k]).item()#torch.dot(vecs[i][k], vecs[j][k]).data[0]
-                    dps[(j, i)] = dps[(i, j)]
-                if (i,i) not in dps:
-                    dps[(i, i)] = 0.0
-                    for k in range(len(vecs[i])):
-                        dps[(i,i)] += torch.dot(vecs[i][k], vecs[i][k]).item()#torch.dot(vecs[i][k], vecs[i][k]).data[0]
-                if (j,j) not in dps:
-                    dps[(j, j)] = 0.0   
-                    for k in range(len(vecs[i])):
-                        dps[(j, j)] += torch.dot(vecs[j][k], vecs[j][k]).item()#torch.dot(vecs[j][k], vecs[j][k]).data[0]
-                c,d = MinNormSolver._min_norm_element_from2(dps[(i,i)], dps[(i,j)], dps[(j,j)])
-                if d < dmin:
-                    dmin = d
-                    sol = [(i,j),c,d]
-        return sol, dps
-
-    def _projection2simplex(y):
-        """
-        Given y, it solves argmin_z |y-z|_2 st \sum z = 1 , 1 >= z_i >= 0 for all i
-        """
-        m = len(y)
-        sorted_y = np.flip(np.sort(y), axis=0)
-        tmpsum = 0.0
-        tmax_f = (np.sum(y) - 1.0)/m
-        for i in range(m-1):
-            tmpsum+= sorted_y[i]
-            tmax = (tmpsum - 1)/ (i+1.0)
-            if tmax > sorted_y[i+1]:
-                tmax_f = tmax
-                break
-        return np.maximum(y - tmax_f, np.zeros(y.shape))
-    
-    def _next_point(cur_val, grad, n):
-        proj_grad = grad - ( np.sum(grad) / n )
-        tm1 = -1.0*cur_val[proj_grad<0]/proj_grad[proj_grad<0]
-        tm2 = (1.0 - cur_val[proj_grad>0])/(proj_grad[proj_grad>0])
+        model.eval()
+        Rec = model.predict().detach().cpu().numpy()
+        item_groups, user_neighbors = item_groups.cpu().numpy().tolist(), user_neighbors.cpu().numpy().tolist()
+        prob_list, nprob_list = calculate_noranking_fairness(args, Rec, val_dict, train_list, item_groups, user_neighbors)
+        rsd, rsdn = display_noranking_results(args, prob_list, nprob_list)
+        if found_initial_solution(args, rsd, rsdn) is True:
+            print('^^^^^ Initial Solution Is Found!!! ^^^^^')
+            break
+    if found_initial_solution(args, rsd, rsdn) is False:
+        print('^^^^^ Warning: Initial Solution Not Found!!! ^^^^^')
+        earlystopper.inzone = False
         
-        skippers = np.sum(tm1<1e-7) + np.sum(tm2<1e-7)
-        t = 1
-        if len(tm1[tm1>1e-7]) > 0:
-            t = np.min(tm1[tm1>1e-7])
-        if len(tm2[tm2>1e-7]) > 0:
-            t = min(t, np.min(tm2[tm2>1e-7]))
-
-        next_point = proj_grad*t + cur_val
-        next_point = MinNormSolver._projection2simplex(next_point)
-        return next_point
-
-    def find_min_norm_element(vecs):
-        """
-        Given a list of vectors (vecs), this method finds the minimum norm element in the convex hull
-        as min |u|_2 st. u = \sum c_i vecs[i] and \sum c_i = 1.
-        It is quite geometric, and the main idea is the fact that if d_{ij} = min |u|_2 st u = c x_i + (1-c) x_j; the solution lies in (0, d_{i,j})
-        Hence, we find the best 2-task solution, and then run the projected gradient descent until convergence
-        """
-        # Solution lying at the combination of two points
-        dps = {}
-        init_sol, dps = MinNormSolver._min_norm_2d(vecs, dps)
         
-        n=len(vecs)
-        sol_vec = np.zeros(n)
-        sol_vec[init_sol[0][0]] = init_sol[1]
-        sol_vec[init_sol[0][1]] = 1 - init_sol[1]
+    epoch_info_loss=[]
+    epoch_info_entropy=[]
+    print('----- Running our method -----')
+    for epoch in range(1, args.max_epoch+1):
+        torch.cuda.empty_cache()
+        print('********** Epoch {} **********'.format(epoch))
+        epoch_start_time = time.time()
+        total_neg_sample_time, total_train_inference_time, total_pareto_time, total_bprloss, total_regloss = 0, 0, 0, 0, 0
+        item_groups, user_neighbors = torch.LongTensor(item_groups).to(device), torch.LongTensor(user_neighbors).to(device)
+        model.train()
+        for _, (users, pos_items) in enumerate(train_loader):
+            grads, losses_vec = {0:[],1:[],2:[],3:[]}, []
+            sample_start_time = time.time()
+            neg_items = random_sampler(users.numpy(), pos_items.numpy(), train_list, args)
+            sample_end_time = time.time()
 
-        if n < 3:
-            # This is optimal for n=2, so return the solution
-            return sol_vec , init_sol[2]
-    
-        iter_count = 0
+            users, pos_items, neg_items = users.to(device), pos_items.to(device), neg_items.to(device)
+            pos_scores, neg_scores = model.calculate_pos_neg_scores(users, pos_items, neg_items)
+            bprloss, regloss = model.calculate_loss(pos_scores, neg_scores)
+            recloss = bprloss + args.reg*regloss
+            total_bprloss += bprloss.detach().cpu().item()
+            total_regloss += args.reg*regloss.detach().cpu().item()
+            
+            info_entropy=calculate_Info_Entropy(item_groups.cpu(), users.cpu(), model.predict().detach().cpu(), topic_num)
+            epoch_info_entropy.append(info_entropy)
+            info_loss=torch.nn.functional.binary_cross_entropy(torch.sigmoid(model.predict()), target)
+            epoch_info_loss.append(info_loss)
 
-        grad_mat = np.zeros((n,n))
-        for i in range(n):
-            for j in range(n):
-                grad_mat[i,j] = dps[(i, j)]
+            pareto_start_time = time.time()
+            speo_pt, nspneo_pt = batch_group_probs(args, users, item_groups, user_neighbors, pos_items, neg_items, pos_scores, neg_scores)
+            rsd_speo, rsd_nspneo = torch.std(speo_pt) / torch.mean(speo_pt), torch.std(nspneo_pt) / torch.mean(nspneo_pt)
+            for i in range(4):
+                optimizer.zero_grad()
+                if i==0:
+                    rsd_speo.backward(retain_graph=True)
+                elif i==1:
+                    rsd_nspneo.backward(retain_graph=True)
+                elif i==2:
+                    recloss.backward(retain_graph=True)
+                else:
+                    info_loss.backward(retain_graph=True)
+                for param in model.parameters():
+                    if param.grad is not None:
+                        grads[i].append(Variable(param.grad.data.clone().flatten(), requires_grad=False))
+
+            grads = torch.stack([torch.cat(grads[i]) for i in range(4)])
+            losses_vec = torch.stack([rsd_speo.data, rsd_nspneo.data])    # calculate the weights
+            
+            weight_vec = get_d_paretomtl_infoentropy(grads, losses_vec, ref_vec, pref_idx, recloss, args.thre,info_loss,args.thre_ie)
+            #normalize_coeff = n_tasks / torch.sum(torch.abs(weight_vec))
+            #weight_vec = weight_vec * normalize_coeff
+            pareto_end_time = time.time()
+
+            if len(weight_vec) == 2:
+                normalize_coeff = n_tasks / torch.sum(torch.abs(weight_vec))
+                weight_vec = weight_vec * normalize_coeff
+                loss_total = weight_vec[0] * rsd_speo + weight_vec[1] * rsd_nspneo
                 
+                #考虑rec loss不考虑信息熵
+            elif len(weight_vec) == 3:
+                normalize_coeff = n_tasks / torch.sum(torch.abs(weight_vec))
+                weight_vec = weight_vec * normalize_coeff
+                loss_total = weight_vec[0] * rsd_speo + weight_vec[1] * rsd_nspneo + weight_vec[2] * recloss
+                
+                #此时不考虑rec loss考虑信息熵
+            else:
+                weight_vec= weight_vec[:-1]
+                normalize_coeff = n_tasks / torch.sum(torch.abs(weight_vec))
+                weight_vec = weight_vec * normalize_coeff
+                loss_total = weight_vec[0] * rsd_speo + weight_vec[1] * rsd_nspneo + 2 * weight_vec[2] * info_loss
+            
+            loss_total.backward()
+            optimizer.step()
 
-        while iter_count < MinNormSolver.MAX_ITER:
-            grad_dir = -1.0*np.dot(grad_mat, sol_vec)
-            new_point = MinNormSolver._next_point(sol_vec, grad_dir, n)
-            # Re-compute the inner products for line search
-            v1v1 = 0.0
-            v1v2 = 0.0
-            v2v2 = 0.0
-            for i in range(n):
-                for j in range(n):
-                    v1v1 += sol_vec[i]*sol_vec[j]*dps[(i,j)]
-                    v1v2 += sol_vec[i]*new_point[j]*dps[(i,j)]
-                    v2v2 += new_point[i]*new_point[j]*dps[(i,j)]
-            nc, nd = MinNormSolver._min_norm_element_from2(v1v1, v1v2, v2v2)
-            new_sol_vec = nc*sol_vec + (1-nc)*new_point
-            change = new_sol_vec - sol_vec
-            if np.sum(np.abs(change)) < MinNormSolver.STOP_CRIT:
-                return sol_vec, nd
-            sol_vec = new_sol_vec
+            total_train_inference_time += (pareto_start_time + time.time() - sample_end_time - pareto_end_time)
+            total_pareto_time += (pareto_end_time - pareto_start_time)
+            total_neg_sample_time += (sample_end_time - sample_start_time)
+        print("Information Entropy:",sum(epoch_info_entropy)/len(epoch_info_entropy))
+        print("Information Entropy Loss:",sum(epoch_info_loss)/len(epoch_info_loss))
+        avgbpr, avgreg, avgloss = total_bprloss / len(train_loader), total_regloss / len(train_loader), (total_regloss+total_bprloss) / len(train_loader)
+        print('Time:{:.2f}s = sample_{:.2f}s + trainfer_{:.2f} + pareto_{:.2f}s\tAvgRecLoss:{:.4f} = bpr_{:.4f} + reg_{:.4f}'.format(
+            time.time()-epoch_start_time, total_neg_sample_time, total_train_inference_time, total_pareto_time, avgloss, avgbpr, avgreg
+        ))
+        Rec = model.predict().detach().cpu().numpy()
+        item_groups, user_neighbors = item_groups.cpu().numpy().tolist(), user_neighbors.cpu().numpy().tolist()
+        prob_list, nprob_list = calculate_noranking_fairness(args, Rec, val_dict, train_list, item_groups, user_neighbors)
+        rsd, rsdn = display_noranking_results(args, prob_list, nprob_list)
+        f1value, inzone = f1(rsd,rsdn), found_initial_solution(args, rsd, rsdn)
+        if earlystopper(f1value, model, inzone) is True:
+            break
+    print('Loading {}th epoch'.format(min(epoch-args.patience, args.max_epoch)))
+    model.load_state_dict(earlystopper.best_state)
+    model.eval()
+    Rec = model.predict().detach().cpu().numpy()
+    print('********** Validating **********')
+    _, _, ndcg, sp_list, nsp_list, eo_list, neo_list = New_Eval(args, Rec, val_dict, train_list, item_groups, user_neighbors, K=args.K)
+    display_all_results(ndcg, sp_list, nsp_list, eo_list, neo_list)
+    print('********** Testing **********')
+    _, _, ndcg, sp_list, nsp_list, eo_list, neo_list = New_Eval(args, Rec, test_dict, trainval_list, item_groups, user_neighbors, K=args.K)
+    display_all_results(ndcg, sp_list, nsp_list, eo_list, neo_list)
 
-    def find_min_norm_element_FW(vecs):
-        """
-        Given a list of vectors (vecs), this method finds the minimum norm element in the convex hull
-        as min |u|_2 st. u = \sum c_i vecs[i] and \sum c_i = 1.
-        It is quite geometric, and the main idea is the fact that if d_{ij} = min |u|_2 st u = c x_i + (1-c) x_j; the solution lies in (0, d_{i,j})
-        Hence, we find the best 2-task solution, and then run the Frank Wolfe until convergence
-        """
-        # Solution lying at the combination of two points
-        dps = {}
-        init_sol, dps = MinNormSolver._min_norm_2d(vecs, dps)
 
-        n=len(vecs)
-        sol_vec = np.zeros(n)
-        sol_vec[init_sol[0][0]] = init_sol[1]
-        sol_vec[init_sol[0][1]] = 1 - init_sol[1]
+if __name__ == "__main__":
+    args = parse_args()
+    setup_seed(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    args.device, args.reg = device, args.reg / 2
+    n_tasks, npref, pref_idx = 2, args.npref, args.pref_idx
+    assert args.pref_idx < args.npref
+    assert args.mode in {'sp','eo'}
+    assert args.dataset in {'KuaiRec','Epinions'}
+    train_dict, val_dict, test_dict, num_user, num_item, num_train, _, _, item_groups, user_neighbors, _, _ = get_data(args.dataset)
+    args.num_user, args.num_item, args.num_train, args.num_group = num_user, num_item, num_train, max(item_groups)+1
+    train_loader, train_list, trainval_list = get_dataloader(args, train_dict, val_dict)
+    
 
-        if n < 3:
-            # This is optimal for n=2, so return the solution
-            return sol_vec , init_sol[2]
-
-        iter_count = 0
-
-        grad_mat = np.zeros((n,n))
-        for i in range(n):
-            for j in range(n):
-                grad_mat[i,j] = dps[(i, j)]
-
-        while iter_count < MinNormSolver.MAX_ITER:
-            t_iter = np.argmin(np.dot(grad_mat, sol_vec))
-
-            v1v1 = np.dot(sol_vec, np.dot(grad_mat, sol_vec))
-            v1v2 = np.dot(sol_vec, grad_mat[:, t_iter])
-            v2v2 = grad_mat[t_iter, t_iter]
-
-            nc, nd = MinNormSolver._min_norm_element_from2(v1v1, v1v2, v2v2)
-            new_sol_vec = nc*sol_vec
-            new_sol_vec[t_iter] += 1 - nc
-
-            change = new_sol_vec - sol_vec
-            if np.sum(np.abs(change)) < MinNormSolver.STOP_CRIT:
-                return sol_vec, nd
-            sol_vec = new_sol_vec
+  
+    input_tensor = torch.zeros(num_user, num_item)
+    target = torch.sigmoid(input_tensor).to(device)
+    target.requires_grad = True
+    
+    #计算训练集各用户交互过item的topic的个数
+    topic_num={}
+    for u in train_dict.keys() :
+        user_topic_num = torch.zeros(6, dtype=torch.int64)
+        for i in train_dict[u]:
+            user_topic_num[item_groups[i]] += 1
+        topic_num[u]=user_topic_num
+        
+    model = BaseMF(args).to(device)
+    model.load_state_dict(torch.load('./data/{}/best_model.pth.tar'.format(args.dataset)))
+    train_model(item_groups, user_neighbors)
